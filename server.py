@@ -5800,7 +5800,7 @@ def _parse_imported_date(value: Optional[str]) -> Optional[str]:
 
 
 @api.post("/leads/import")
-async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("admin"))):
+async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("admin", "manager"))):
     organization_id = organization_scope(actor).get("organization_id")
     if not organization_id:
         raise HTTPException(status_code=400, detail="Select an organisation before importing leads")
@@ -5835,6 +5835,10 @@ async def import_leads(body: ImportBody, actor: dict = Depends(require_roles("ad
         }
         if assignees:
             doc["assigned_to"] = assignees[(index - 1) % len(assignees)]
+            if actor.get("role") == "manager":
+                doc["co_assigned_to"] = [actor["id"]]
+        elif actor.get("role") == "manager":
+            doc["assigned_to"] = actor["id"]
         docs.append(doc)
         activities.append({"id": new_id(), "lead_id": doc["id"], "actor_id": actor["id"], "actor_name": actor.get("name"), "kind": "lead_created", "message": "Imported via CSV", "meta": {"imported": True}, "organization_id": organization_id, "created_at": now})
 
