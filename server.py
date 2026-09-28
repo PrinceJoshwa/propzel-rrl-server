@@ -2935,7 +2935,7 @@ async def can_access_lead(lead: dict, user: dict) -> bool:
         return False
     if user.get("role") == "super_admin" and user.get("active_organization_id") and lead.get("organization_id") != user.get("active_organization_id"):
         return False
-    if user.get("role") in {"super_admin", "admin", "manager"}:
+    if user.get("role") in {"super_admin", "admin"}:
         return True
     if lead.get("assigned_to") == user.get("id"):
         return True
@@ -3452,6 +3452,8 @@ async def list_users(all_organizations: bool = False, user: dict = Depends(get_c
     # may explicitly request the cross-organisation directory.
     if user.get("role") == "super_admin" and all_organizations:
         query = {}
+    elif not has_company_wide_access(user):
+        query = {"id": user["id"], **organization_scope(user)}
     else:
         query = organization_scope(user)
     docs = await db.users.find(query, {"password_hash": 0, "_id": 0}).sort("created_at", -1).to_list(500)
@@ -3721,8 +3723,8 @@ async def list_leads(
             {"phone": {"$regex": search, "$options": "i"}},
             {"email": {"$regex": search, "$options": "i"}},
         ]})
-    # Executives see primary and co-owned leads, never another team's work.
-    if user["role"] in {"executive", "sales"}:
+    # Managers and frontline users see primary and co-owned leads, never another team's work.
+    if user["role"] in {"manager", "executive", "sales"}:
         clauses.append({"$or": [{"assigned_to": user["id"]}, {"co_assigned_to": user["id"]}]})
     q = {} if not clauses else (clauses[0] if len(clauses) == 1 else {"$and": clauses})
     docs = await db.leads.find(q, {"_id": 0}).sort("created_at", -1).to_list(2000)
@@ -3779,9 +3781,7 @@ async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin
 
 @api.patch("/leads/{lead_id}")
 async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(require_roles("admin", "manager"))):
-    lead = await db.leads.find_one(scoped_id_query(lead_id, actor))
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await require_lead_access(lead_id, actor)
     update = body.model_dump(exclude_none=True)
     if not update:
         raise HTTPException(status_code=400, detail="Nothing to update")
@@ -3798,6 +3798,7 @@ async def update_lead(lead_id: str, body: UpdateLeadBody, actor: dict = Depends(
 
 @api.post("/leads/{lead_id}/assign")
 async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
+    await require_lead_access(lead_id, actor)
     r = await db.leads.update_one(
         scoped_id_query(lead_id, actor),
         {"$set": {"assigned_to": body.user_id, "updated_at": now_utc().isoformat()}},
@@ -3821,9 +3822,7 @@ async def assign_lead(lead_id: str, body: AssignBody, actor: dict = Depends(requ
 
 @api.post("/leads/{lead_id}/co-assign")
 async def co_assign_lead(lead_id: str, body: CoAssignBody, actor: dict = Depends(require_roles("admin", "manager"))):
-    lead = await db.leads.find_one(scoped_id_query(lead_id, actor))
-    if not lead:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = await require_lead_access(lead_id, actor)
     users = await db.users.find({"id": {"$in": body.user_ids}, "active": {"$ne": False}, "organization_id": organization_scope(actor).get("organization_id")}, {"_id": 0, "id": 1, "name": 1}).to_list(100)
     ids = [u["id"] for u in users]
     await db.leads.update_one(scoped_id_query(lead_id, actor), {"$set": {"co_assigned_to": ids, "updated_at": now_utc().isoformat()}})
@@ -4008,7 +4007,7 @@ async def list_visits(project_id: Optional[str] = None, lead_id: Optional[str] =
         q["project_id"] = project_id
     if lead_id:
         q["lead_id"] = lead_id
-    if user["role"] in {"executive", "sales"}:
+    if user["role"] in {"manager", "executive", "sales"}:
         q["$or"] = [{"assigned_to": user["id"]}, {"presales_owner_id": user["id"]}, {"sales_owner_id": user["id"]}]
     docs = await db.site_visits.find(q, {"_id": 0}).sort("scheduled_at", 1).to_list(2000)
     return docs
@@ -4074,6 +4073,7 @@ async def delete_visit(visit_id: str, actor: dict = Depends(require_roles("admin
     visit = await db.site_visits.find_one(scoped_id_query(visit_id, actor), {"_id": 0})
     if not visit:
         raise HTTPException(status_code=404, detail="Site visit not found")
+    await require_lead_access(visit["lead_id"], actor)
     await sync_site_visit_calendar_event(visit, "delete")
     await db.site_visits.delete_one(scoped_id_query(visit_id, actor))
     return {"ok": True}
@@ -4095,7 +4095,7 @@ async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] 
             q["due_at"]["$gte"] = date_from
         if date_to:
             q["due_at"]["$lte"] = f"{date_to}T23:59:59.999999+00:00" if len(date_to) == 10 else date_to
-    if user["role"] in {"executive", "sales"}:
+    if user["role"] in {"manager", "executive", "sales"}:
         q["assigned_to"] = user["id"]
     docs = await db.follow_ups.find(q, {"_id": 0}).sort("due_at", 1).to_list(2000)
     return docs
@@ -4103,6 +4103,7 @@ async def list_followups(lead_id: Optional[str] = None, status_q: Optional[str] 
 
 @api.post("/follow-ups")
 async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_user)):
+    lead = await require_lead_access(body.lead_id, actor)
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["organization_id"] = organization_scope(actor).get("organization_id")
@@ -4110,8 +4111,7 @@ async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_
     doc["due_at"] = doc["due_at"].astimezone(timezone.utc).isoformat()
     doc["created_at"] = now_utc().isoformat()
     if not doc.get("assigned_to"):
-        lead = await db.leads.find_one(scoped_id_query(doc["lead_id"], actor), {"assigned_to": 1})
-        doc["assigned_to"] = (lead or {}).get("assigned_to")
+        doc["assigned_to"] = lead.get("assigned_to")
     await db.follow_ups.insert_one(doc)
     doc.pop("_id", None)
     await log_activity(doc["lead_id"], actor, "followup_scheduled", f"Follow-up scheduled at {doc['due_at']}")
@@ -4130,6 +4130,10 @@ async def create_followup(body: FollowUpBody, actor: dict = Depends(get_current_
 
 @api.patch("/follow-ups/{fu_id}")
 async def update_followup(fu_id: str, body: UpdateFollowUpBody, actor: dict = Depends(get_current_user)):
+    existing = await db.follow_ups.find_one(scoped_id_query(fu_id, actor), {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    await require_lead_access(existing["lead_id"], actor)
     update = body.model_dump(exclude_none=True)
     if "due_at" in update and isinstance(update["due_at"], datetime):
         update["due_at"] = update["due_at"].astimezone(timezone.utc).isoformat()
@@ -4143,6 +4147,10 @@ async def update_followup(fu_id: str, body: UpdateFollowUpBody, actor: dict = De
 
 @api.delete("/follow-ups/{fu_id}")
 async def delete_followup(fu_id: str, actor: dict = Depends(get_current_user)):
+    existing = await db.follow_ups.find_one(scoped_id_query(fu_id, actor), {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Follow-up not found")
+    await require_lead_access(existing["lead_id"], actor)
     result = await db.follow_ups.delete_one(scoped_id_query(fu_id, actor))
     if not result.deleted_count:
         raise HTTPException(status_code=404, detail="Follow-up not found")
@@ -4159,12 +4167,19 @@ async def list_activities(lead_id: Optional[str] = None, limit: int = 50, user: 
         q["lead_id"] = lead_id
     if lead_id:
         await require_lead_access(lead_id, user)
-    elif user.get("role") not in {"admin", "manager"}:
+    elif not has_company_wide_access(user):
         lead_ids = [
             d["id"]
-            for d in await db.leads.find({"assigned_to": user["id"], **organization_scope(user)}, {"id": 1, "_id": 0}).to_list(2000)
+            for d in await db.leads.find(
+                {"$or": [{"assigned_to": user["id"]}, {"co_assigned_to": user["id"]}], **organization_scope(user)},
+                {"id": 1, "_id": 0},
+            ).to_list(2000)
         ]
-        q["lead_id"] = {"$in": lead_ids} if lead_ids else "__none__"
+        q["$or"] = [
+            {"lead_id": {"$in": lead_ids} if lead_ids else "__none__"},
+            {"actor_id": user["id"]},
+            {"user_id": user["id"]},
+        ]
     docs = await db.activities.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
     return [sanitize_activity_doc(d, user) for d in docs]
 
@@ -5912,15 +5927,13 @@ async def list_partners(user: dict = Depends(get_current_user)):
 
 
 async def _can_manage_channel_partners(actor: dict) -> bool:
-    if actor.get("role") in {"admin", "super_admin"}:
-        return True
-    return actor.get("role") == "manager" and await _organization_has_built_up_area(organization_scope(actor).get("organization_id"))
+    return actor.get("role") in {"admin", "manager", "super_admin"}
 
 
 @api.post("/channel-partners")
 async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(get_current_user)):
     if not await _can_manage_channel_partners(actor):
-        raise HTTPException(status_code=403, detail="Only Jagati managers and administrators can add channel partners")
+        raise HTTPException(status_code=403, detail="Only managers and administrators can add channel partners")
     doc = body.model_dump()
     doc["id"] = new_id()
     doc["organization_id"] = organization_scope(actor).get("organization_id")
@@ -5933,7 +5946,7 @@ async def create_partner(body: ChannelPartnerBody, actor: dict = Depends(get_cur
 @api.patch("/channel-partners/{pid}")
 async def update_partner(pid: str, body: ChannelPartnerBody, actor: dict = Depends(get_current_user)):
     if not await _can_manage_channel_partners(actor):
-        raise HTTPException(status_code=403, detail="Only Jagati managers and administrators can edit channel partners")
+        raise HTTPException(status_code=403, detail="Only managers and administrators can edit channel partners")
     r = await db.channel_partners.update_one(scoped_id_query(pid, actor), {"$set": body.model_dump(exclude_none=True)})
     if r.matched_count == 0:
         raise HTTPException(status_code=404, detail="Partner not found")
