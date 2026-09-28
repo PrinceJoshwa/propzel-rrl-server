@@ -3738,7 +3738,7 @@ async def get_lead(lead_id: str, user: dict = Depends(get_current_user)):
 
 
 @api.post("/leads")
-async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin"))):
+async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin", "manager"))):
     doc = body.model_dump()
     doc["id"] = new_id()
     organization_id = organization_scope(actor).get("organization_id")
@@ -3748,7 +3748,11 @@ async def create_lead(body: LeadBody, actor: dict = Depends(require_roles("admin
     doc["created_at"] = now_utc().isoformat()
     doc["updated_at"] = doc["created_at"]
     doc.setdefault("priority", "warm")
-    if not doc.get("assigned_to"):
+    # Managers can create leads, but do not get access to another user's work.
+    # Keep every manager-created lead in the manager's own scope.
+    if actor["role"] == "manager":
+        doc["assigned_to"] = actor["id"]
+    elif not doc.get("assigned_to"):
         settings = await db.settings.find_one({"id": f"organization:{organization_id}"}) or {}
         if settings.get("auto_assign_enabled", True):
             doc["assigned_to"] = await _pick_auto_assignee(organization_id)
